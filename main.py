@@ -117,7 +117,7 @@ class TopologyService:
     def get_bfs_ordering(G: nx.Graph, root_id: str) -> List[str]:
         """
         Returns topological ordering using BFS. 
-        [cite_start]Essential for determining flow direction in FBS[cite: 97].
+        Essential for determining flow direction in FBS.
         """
         if root_id not in G.nodes:
             raise ValueError("Root node not found in grid.")
@@ -137,14 +137,14 @@ class PowerFlowSolver:
         TopologyService.validate_radiality(G)
         order = TopologyService.get_bfs_ordering(G, root_id)
         
-        # [cite_start]Initialization (Flat Start) [cite: 138]
+        # Initialization (Flat Start)
         voltages = {b.id: complex(b.voltage_level_kv, 0) for b in grid.buses}
         
         for _ in range(max_iter):
             max_v_diff = 0.0
             
             # --- 1. Load Injection Calculation ---
-            # [cite_start]I_load = (S / V)* [cite: 131]
+            # I_load = (S / V)*
             node_currents = {node: 0j for node in order}
             for load in grid.loads:
                 v_node = voltages[load.bus]
@@ -154,7 +154,7 @@ class PowerFlowSolver:
 
             # --- 2. Backward Sweep & Forward Sweep Combined ---
             
-            # [cite_start]Forward Sweep (Voltage Update) [cite: 133]
+            # Forward Sweep (Voltage Update)
             for node_id in order:
                 if node_id == root_id: continue
                 
