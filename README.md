@@ -4,10 +4,10 @@
 This project implements a hybrid physics-software engine for analyzing low-voltage distribution grids. It was engineered to address specific DSO challenges such as reverse power flows and voltage violations caused by Distributed Energy Resources (DERs).
 
 ## Key Features
-- [cite_start]**Physics Core:** Forward-Backward Sweep (FBS) solver optimized for high R/X ratio radial feeders[cite: 127].
-- [cite_start]**Domain Modeling:** IEC 61970 (CIM) compliant data models using Pydantic for robust type validation[cite: 41, 52].
+- [cite_start]**Physics Core:** Forward-Backward Sweep (FBS) solver optimized for high R/X ratio radial feeders.
+- [cite_start]**Domain Modeling:** IEC 61970 (CIM) compliant data models using Pydantic for robust type validation.
 - **Advanced Controls:** Fuzzy Logic Controller for Volt-VAR optimization in PV inverters.
-- [cite_start]**Analytics:** Hosting Capacity Analysis using binary search ($O(\log N)$) for rapid connection assessment[cite: 163].
+- [cite_start]**Analytics:** Hosting Capacity Analysis using binary search ($O(\log N)$) for rapid connection assessment.
 
 ## Architecture
 - **Layer 1: Domain Data (Pydantic):** Enforces physical constraints (e.g., non-negative resistance) at the I/O boundary.
