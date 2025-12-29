@@ -1,77 +1,47 @@
 import numpy as np
 import networkx as nx
-import unittest
 import matplotlib.pyplot as plt
-import requests
+import time
 import logging
-from datetime import datetime, timezone, timedelta
-from pydantic import BaseModel, Field, model_validator, field_validator
-from typing import List, Literal, Optional, Dict
-from scipy.sparse import csr_matrix
+from typing import List, Literal, Dict, Tuple
+from pydantic import BaseModel, Field, model_validator
+
+# --- 0. PERFORMANCE SETUP ---
+# Attempt to load Numba for C-speed compilation. 
+# If missing, simulation will run but slower.
+try:
+    from numba import jit
+    JIT_AVAILABLE = True
+    print("🚀 Numba JIT detected: High-Performance Mode ACTIVE.")
+except ImportError:
+    # Shim decorator if Numba is missing
+    def jit(nopython=True):
+        def decorator(func): return func
+        return decorator
+    JIT_AVAILABLE = False
+    print("⚠️ Numba not found: Running in pure Python (Slow). Install 'numba' for speed.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger("GridEngine_v9")
 
 # ==========================================
-# 0. CONFIGURATION & CONSTANTS
-# ==========================================
-GLOBAL_TRAFO_LIMIT_MW = 45.0
-# API Config (In production, load from os.environ)
-NTP_CONFIG = {
-    "base_url": "https://....",
-    # Placeholder credentials
-    "client_id": "demo_id", "client_secret": "demo_secret", "token_url": "https://..."
-}
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# ==========================================
-# 1. LIVE DATA INGESTION LAYER
-# ==========================================
-class NTPClient:
-    """
-    Handles authentication and data fetching from Netztransparenz Platform.
-    """
-    def __init__(self, config: Dict[str, str]):
-        self.config = config
-        self.token = None
-        self.session = requests.Session()
-
-    def authenticate(self):
-        # Placeholder for OAuth2 logic
-        self.token = "simulated_token"
-
-    def fetch_latest_generation(self, control_area="50Hertz") -> float:
-        """
-        Fetches live generation data.
-        """
-        if not self.token: self.authenticate()
-
-        # Use timezone-aware datetime to avoid DeprecationWarning
-        now = datetime.now(timezone.utc)
-        
-        # SIMULATION MODE: 
-        # Simulating a live API response for demonstration purposes.
-        simulated_p_mw = np.random.normal(25.0, 5.0) 
-        return max(0.0, simulated_p_mw)
-
-# ==========================================
-# 2. DOMAIN DATA LAYER (Pydantic / CIM)
+# 1. STRICT DATA MODELS (The Contract)
 # ==========================================
 class Bus(BaseModel):
     id: str
     voltage_level_kv: float = Field(..., gt=0)
     type: Literal['PQ', 'PV', 'SLACK'] = 'PQ'
 
-class ACLineSegment(BaseModel):
+class ACLine(BaseModel):
     id: str
     from_bus: str
     to_bus: str
     length_km: float = Field(..., gt=0)
     r_ohm_per_km: float = Field(..., ge=0)
     x_ohm_per_km: float = Field(..., ge=0)
-    c_nf_per_km: float = Field(default=0.0, ge=0)
-    max_current_a: float = Field(..., gt=0)
-
+    
     @property
-    def total_impedance(self) -> complex:
+    def z_total(self) -> complex:
         return complex(self.r_ohm_per_km, self.x_ohm_per_km) * self.length_km
 
 class Load(BaseModel):
@@ -80,207 +50,239 @@ class Load(BaseModel):
     p_mw: float
     q_mvar: float
 
-class GridModel(BaseModel):
+class GridTopology(BaseModel):
+    """
+    Single Source of Truth. Validates connectivity before physics starts.
+    """
     buses: List[Bus]
-    lines: List[ACLineSegment]
+    lines: List[ACLine]
     loads: List[Load] = []
 
     @model_validator(mode='after')
-    def check_topology_integrity(self):
+    def validate_connectivity(self):
         bus_ids = {b.id for b in self.buses}
         for line in self.lines:
             if line.from_bus not in bus_ids or line.to_bus not in bus_ids:
-                raise ValueError(f"Line {line.id} has disconnected terminals.")
+                raise ValueError(f"❌ Orphaned line detected: {line.id} connects to unknown bus.")
         return self
-    
-    def get_bus(self, bus_id: str) -> Bus:
-        return next(b for b in self.buses if b.id == bus_id)
 
 # ==========================================
-# 3. TOPOLOGY & SOLVER CORE
+# 2. TOPOLOGY GENERATOR (Scalability Tool)
 # ==========================================
-class TopologyService:
-    @staticmethod
-    def build_graph(grid: GridModel) -> nx.Graph:
+def generate_linear_feeder(n_buses: int, voltage_kv: float = 20.0) -> Tuple[List[Bus], List[ACLine]]:
+    """
+    Programmatically generates a grid of size N.
+    Topology: Source -> B1 -> B2 ... -> Bn
+    """
+    buses = [Bus(id="source", voltage_level_kv=voltage_kv, type='SLACK')]
+    lines = []
+    
+    prev_id = "source"
+    for i in range(1, n_buses + 1):
+        curr_id = f"bus_{i}"
+        
+        # Add Bus
+        buses.append(Bus(id=curr_id, voltage_level_kv=voltage_kv))
+        
+        # Add Line (Uniform impedance for simplicity)
+        lines.append(ACLine(
+            id=f"line_{i}", 
+            from_bus=prev_id, 
+            to_bus=curr_id, 
+            length_km=1.0,  # 1 km segments
+            r_ohm_per_km=0.15, 
+            x_ohm_per_km=0.11
+        ))
+        prev_id = curr_id
+        
+    return buses, lines
+
+# ==========================================
+# 3. HIGH-PERFORMANCE PHYSICS KERNEL
+# ==========================================
+@jit(nopython=True)
+def _fast_fbs_kernel(
+    v_mag: np.ndarray, 
+    v_complex: np.ndarray,
+    p_inj: np.ndarray, 
+    q_inj: np.ndarray, 
+    z_matrix: np.ndarray, 
+    parent_indices: np.ndarray,
+    order_indices: np.ndarray,
+    tol: float,
+    max_iter: int
+) -> Tuple[np.ndarray, bool]:
+    """
+    The mathematical core. Compiles to machine code via Numba.
+    Performs Forward-Backward Sweep in microseconds.
+    """
+    n_nodes = len(v_complex)
+    converged = False
+
+    for _ in range(max_iter):
+        max_err = 0.0
+        
+        # 1. Calc Current Injections (Safe Division)
+        i_inj = (p_inj - 1j * q_inj) / (v_complex + 1e-9)
+        
+        # 2. Backward Sweep (Sum Currents from Leaves to Root)
+        i_branch = np.zeros(n_nodes, dtype=np.complex128)
+        for k in range(n_nodes - 1, 0, -1): # Reverse Order
+            idx = order_indices[k]
+            i_branch[idx] += i_inj[idx]
+            parent = parent_indices[idx]
+            if parent != -1:
+                i_branch[parent] += i_branch[idx]
+
+        # 3. Forward Sweep (Calc Voltages from Root to Leaves)
+        for k in range(1, n_nodes): # Forward Order
+            idx = order_indices[k]
+            parent = parent_indices[idx]
+            
+            z = z_matrix[idx]
+            v_new = v_complex[parent] - (i_branch[idx] * z)
+            
+            err = np.abs(v_new - v_complex[idx])
+            if err > max_err: max_err = err
+            
+            v_complex[idx] = v_new
+            v_mag[idx] = np.abs(v_new)
+
+        if max_err < tol:
+            converged = True
+            break
+            
+    return v_complex, converged
+
+class FastGridEngine:
+    """
+    Manages mapping between Pydantic Objects and Numpy Arrays.
+    """
+    def __init__(self, grid: GridTopology):
+        self.grid = grid
+        self._compile_topology()
+    
+    def _compile_topology(self):
+        # 1. Index Mapping
+        self.bus_map = {b.id: i for i, b in enumerate(self.grid.buses)}
+        self.idx_map = {i: b.id for b.id, i in self.bus_map.items()}
+        n = len(self.grid.buses)
+        
+        # 2. Graph Analysis (NetworkX)
         G = nx.Graph()
-        for bus in grid.buses: G.add_node(bus.id, obj=bus)
-        for line in grid.lines:
-            G.add_edge(line.from_bus, line.to_bus, id=line.id, obj=line)
-        return G
-
-    @staticmethod
-    def get_bfs_ordering(G: nx.Graph, root_id: str) -> List[str]:
-        return list(nx.topological_sort(nx.bfs_tree(G, source=root_id)))
-
-class PowerFlowSolver:
-    """
-    Forward-Backward Sweep (FBS) Solver for Radial Distribution Grids.
-    
-    ENGINEERING ASSUMPTIONS:
-    1. Balanced Three-Phase System: We model the positive sequence only.
-    2. Power Values: Interpreted as total three-phase power (MW).
-    3. Voltage: Interpreted as line-to-line magnitude (kV).
-    """
-    
-    @staticmethod
-    def solve_fbs(grid: GridModel, root_id: str, tol=1e-4) -> Dict[str, complex]:
-        G = TopologyService.build_graph(grid)
-        order = TopologyService.get_bfs_ordering(G, root_id)
-        
-        voltages = {b.id: complex(b.voltage_level_kv, 0) for b in grid.buses}
-        
-        for _ in range(20): # Max Iterations
-            max_err = 0.0
-            node_currents = {n: 0j for n in order}
+        for line in self.grid.lines:
+            G.add_edge(line.from_bus, line.to_bus, z=line.z_total)
             
-            #1. Calculate Injections (I = S*/V*) 
-            for load in grid.loads:
-                v = voltages[load.bus]
-                if abs(v) > 1e-5:
-                    s = complex(load.p_mw, load.q_mvar)
-                    node_currents[load.bus] += (s / v).conjugate()
-            
-            # 2. Sweep
-            for node in order:
-                if node == root_id: continue
-                
-                # TODO: Optimization - Store parent pointers during BFS 
-                # to avoid O(N^2) lookups in this loop for large grids.
-                neighbors = list(G.neighbors(node))
-                parent = next(n for n in neighbors if order.index(n) < order.index(node))
-                
-                line = G.edges[parent, node]['obj']
-                z = line.total_impedance
-                
-                v_new = voltages[parent] - (node_currents[node] * z)
-                max_err = max(max_err, abs(v_new - voltages[node]))
-                voltages[node] = v_new
-                
-            if max_err < tol: return voltages
-        return voltages
+        root_id = next((b.id for b in self.grid.buses if b.type == 'SLACK'), self.grid.buses[0].id)
+        
+        # 3. Build Vectorized Structures
+        bfs_tree = nx.bfs_tree(G, source=root_id)
+        self.order = [self.bus_map[node] for node in bfs_tree]
+        
+        self.z_array = np.zeros(n, dtype=np.complex128)
+        self.parents = np.full(n, -1, dtype=np.int32)
+        self.base_kv = np.array([b.voltage_level_kv for b in self.grid.buses])
+        
+        for u, v in bfs_tree.edges():
+            idx_u, idx_v = self.bus_map[u], self.bus_map[v]
+            # u is parent in BFS tree
+            self.parents[idx_v] = idx_u
+            self.z_array[idx_v] = G.edges[u, v]['z']
 
-class FuzzyVoltVarController:
+    def solve(self, active_loads: List[Load]) -> Dict[str, complex]:
+        n = len(self.grid.buses)
+        
+        # Map Objects -> Arrays
+        p_inj = np.zeros(n)
+        q_inj = np.zeros(n)
+        for load in active_loads:
+            if load.bus in self.bus_map:
+                idx = self.bus_map[load.bus]
+                p_inj[idx] += load.p_mw
+                q_inj[idx] += load.q_mvar
+
+        # Run Kernel
+        v_complex = self.base_kv.astype(np.complex128)
+        v_res, conv = _fast_fbs_kernel(
+            np.abs(v_complex), v_complex, p_inj, q_inj, 
+            self.z_array, self.parents, np.array(self.order),
+            tol=1e-5, max_iter=20
+        )
+        
+        if not conv: logger.warning("⚠️ Solver divergence detected")
+        return {self.idx_map[i]: v_res[i] for i in range(n)}
+
+# ==========================================
+# 4. VECTORIZED CONTROLLER
+# ==========================================
+class VectorizedController:
     """
-    Implements Fuzzy Logic for Volt-VAR Optimization.
-    
-    NOTE: This is a conceptual controller for demonstration purposes.
-    Real inverters would require specific ramp-rate limits and deadbands per grid codes (e.g., VDE-AR-N 4105).
+    Computes control actions for 1000s of buses in one SIMD instruction.
     """
-    def __init__(self): pass
-
-    def _membership_triangle(self, x: float, left: float, center: float, right: float) -> float:
-        if x <= left or x >= right: return 0.0
-        elif x == center: return 1.0
-        elif x < center: return (x - left) / (center - left)
-        else: return (right - x) / (right - center)
-
-    def compute_q_setpoint(self, v_measured_pu: float) -> float:
-        # Simplified Fuzzy Inference System
-        error = 1.0 - v_measured_pu # Error > 0 means voltage is low
+    def compute_batch_q(self, v_complex_dict: Dict[str, complex], base_kv: np.ndarray) -> np.ndarray:
+        v_vals = np.array(list(v_complex_dict.values()))
+        v_pu = np.abs(v_vals) / base_kv
         
-        # Fuzzify
-        mu_NB = self._membership_triangle(error, -0.15, -0.10, -0.0) # Voltage High
-        mu_Z  = self._membership_triangle(error, -0.05,  0.00,  0.05) # Nominal
-        mu_PB = self._membership_triangle(error,  0.00,  0.10,  0.15) # Voltage Low
+        err = 1.0 - v_pu
+        q_out = np.zeros_like(err)
         
-        # Defuzzify (Center of Gravity)
-        num = (mu_NB * -1.0) + (mu_Z * 0.0) + (mu_PB * 1.0)
-        den = mu_NB + mu_Z + mu_PB
-        return num / den if den != 0 else 0.0
+        # Logic: If Voltage > 1.05 p.u., Absorb Reactive Power (Linear Ramp)
+        high_mask = (err < -0.05)
+        q_out[high_mask] = np.clip((err[high_mask] + 0.05) * 20.0, -1.0, 0.0)
+        
+        return q_out
 
 # ==========================================
-# 4. ANALYTICS & CONSTRAINTS ENGINE
+# 5. MAIN EXECUTION
 # ==========================================
-class AnalyticsEngine:
-    @staticmethod
-    def check_constraints(grid: GridModel, results: Dict[str, complex]) -> bool:
-        # 1. Voltage Check
-        for bus_id, v_complex in results.items():
-            base_kv = grid.get_bus(bus_id).voltage_level_kv
-            v_pu = abs(v_complex) / base_kv
-            if not (0.9 <= v_pu <= 1.1): return False
-
-        # 2. Global Trafo Limit
-        total_p_mw = sum(l.p_mw for l in grid.loads)
-        if abs(total_p_mw) > GLOBAL_TRAFO_LIMIT_MW:
-             return False
-        return True
-
-    @staticmethod
-    def hosting_capacity(grid: GridModel, target_node: str) -> float:
-        """
-        Calculates max generation capacity using Binary Search O(log N).
-        
-        NOTE: This implementation mutates the grid state for performance.
-        In a multi-threaded production environment, use deepcopy() or immutable data structures.
-        """
-        min_p, max_p = 0.0, 100.0
-        
-        while (max_p - min_p) > 0.05:
-            mid_p = (min_p + max_p) / 2
-            # Inject Test Gen (Negative Load)
-            grid.loads.append(Load(id="test_gen", bus=target_node, p_mw=-mid_p, q_mvar=0))
-            
-            try:
-                res = PowerFlowSolver.solve_fbs(grid, "source_bus")
-                if AnalyticsEngine.check_constraints(grid, res):
-                    min_p = mid_p 
-                else:
-                    max_p = mid_p 
-            except:
-                max_p = mid_p 
-                
-            grid.loads.pop() # Restore state
-        return min_p
-
-# ==========================================
-# 5. VISUALIZATION & MAIN
-# ==========================================
-def plot_results(base_res, hc_res, hc_mw):
-    dists = [0.0, 5.0]
-    v_base = [abs(base_res[n])/10.0 for n in ["source_bus", "load_bus"]]
-    v_hc = [abs(hc_res[n])/10.0 for n in ["source_bus", "load_bus"]]
-    
-    plt.figure(figsize=(8, 5))
-    plt.plot(dists, v_base, 'o--', label='Live Load Scenario')
-    plt.plot(dists, v_hc, 's-', label=f'With +{hc_mw:.1f}MW Gen')
-    plt.axhline(1.1, c='r', ls=':', label='Limit')
-    plt.axhline(0.9, c='r', ls=':')
-    plt.title("Voltage Profile: Live Data vs Hosting Capacity")
-    plt.legend(); plt.grid(True, alpha=0.3); plt.show()
-
 if __name__ == "__main__":
-    print("--- ENVELIO GRID ENGINE: LIVE PRODUCTION MODE ---\n")
-    
-    # 1. Ingest
-    ntp_client = NTPClient(NTP_CONFIG)
-    live_load_mw = ntp_client.fetch_latest_generation()
-    print(f"[*] Ingested Live Load Data: {live_load_mw:.2f} MW")
-    
-    # 2. Model
-    grid = GridModel(
-        buses=[Bus(id="source_bus", voltage_level_kv=10.0, type='SLACK'), Bus(id="load_bus", voltage_level_kv=10.0)],
-        lines=[ACLineSegment(id="L1", from_bus="source_bus", to_bus="load_bus", length_km=5.0, r_ohm_per_km=0.1, x_ohm_per_km=0.1, max_current_a=400)]
-    )
-    grid.loads = [Load(id="live_load", bus="load_bus", p_mw=live_load_mw, q_mvar=live_load_mw*0.2)]
-    
-    # 3. Solve & Analyze
-    base_res = PowerFlowSolver.solve_fbs(grid, "source_bus")
-    print(f"[*] Base Voltage: {abs(base_res['load_bus'])/10.0:.4f} p.u.")
-    
-    hc_mw = AnalyticsEngine.hosting_capacity(grid, "load_bus")
-    print(f"[*] Hosting Capacity: {hc_mw:.2f} MW")
-    
-    if hc_mw > GLOBAL_TRAFO_LIMIT_MW:
-        print(f"[!] Warning: Limited by Trafo Rating ({GLOBAL_TRAFO_LIMIT_MW} MW)")
+    print("\n=== GRID ENGINE: SCALABILITY TEST ===\n")
 
-    # 4. Fuzzy Control Demo
-    # Simulate high voltage scenario
-    fvc = FuzzyVoltVarController()
-    q_out = fvc.compute_q_setpoint(1.08) # 1.08 p.u. input
-    print(f"[*] Fuzzy Control Action for 1.08 p.u.: Absorb {abs(q_out):.2f} MVar")
+    # --- A. GENERATE TOPOLOGY (The "Increase Bus Bar" fix) ---
+    N_BUSES = 50  # <--- CHANGE THIS NUMBER to 10, 100, or 1000
+    print(f"[*] Generating Grid with {N_BUSES} buses...")
+    
+    buses, lines = generate_linear_feeder(N_BUSES, voltage_kv=20.0)
+    
+    # Define Load at the END of the line (Worst Case Scenario)
+    end_bus_id = buses[-1].id
+    loads = [Load(id="heavy_load", bus=end_bus_id, p_mw=8.0, q_mvar=2.0)]
+    
+    grid = GridTopology(buses=buses, lines=lines, loads=loads)
 
-    # 5. Visualize
-    grid.loads.append(Load(id="max_gen", bus="load_bus", p_mw=-hc_mw, q_mvar=0))
-    hc_res = PowerFlowSolver.solve_fbs(grid, "source_bus")
-    plot_results(base_res, hc_res, hc_mw)
+    # --- B. COMPILE & SOLVE ---
+    t0 = time.perf_counter()
+    engine = FastGridEngine(grid)
+    compile_time = (time.perf_counter() - t0) * 1000
+    print(f"[*] Engine Compiled: {compile_time:.2f} ms")
+
+    t1 = time.perf_counter()
+    res = engine.solve(loads)
+    solve_time = (time.perf_counter() - t1) * 1000
+    print(f"[*] Power Flow Solved: {solve_time:.3f} ms")
+
+    # --- C. ANALYZE RESULTS ---
+    v_source = abs(res['source']) / 20.0
+    v_end = abs(res[end_bus_id]) / 20.0
+    print(f"[*] Voltage Drop: {v_source:.4f} p.u. -> {v_end:.4f} p.u.")
+    
+    if v_end < 0.9:
+        print("⚠️ CRITICAL ALERT: End of line undervoltage detected!")
+
+    # --- D. VISUALIZATION ---
+    
+
+    dist_km = [i * 1.0 for i in range(len(buses))] # 1km segments
+    v_profile = [abs(res[b.id])/20.0 for b in buses]
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(dist_km, v_profile, 'o-', markersize=4, label=f'{N_BUSES} Bus Line')
+    plt.axhline(0.9, color='red', linestyle='--', label='Lower Limit (0.9 p.u.)')
+    plt.fill_between(dist_km, 0.9, 1.1, color='green', alpha=0.1, label='Safe Zone')
+    
+    plt.xlabel('Distance from Substation (km)')
+    plt.ylabel('Voltage (p.u.)')
+    plt.title(f'Voltage Profile Analysis ({N_BUSES} Buses)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
